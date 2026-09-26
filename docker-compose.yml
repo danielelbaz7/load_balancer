@@ -1,0 +1,31 @@
+# Dev setup: one Linux container with the source mounted.
+# Backends + bench services get added once the LB code exists.
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: lb-dev
+    container_name: lb-dev
+    volumes:
+      - .:/src
+      - build:/build          # Linux build output, kept separate from CLion's cmake-build-*
+    ports:
+      - "8080:8080"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.ip_local_port_range: "1024 65000"
+      net.ipv4.tcp_tw_reuse: 1
+    cap_add:
+      - SYS_PTRACE            # lets gdb/strace attach
+    security_opt:
+      - seccomp:unconfined
+    stdin_open: true
+    tty: true
+
+volumes:
+  build:
