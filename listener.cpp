@@ -46,3 +46,25 @@ Listener::Listener(uint16_t port, AcceptCallback on_accept)
         fail("listen");
     }
 }
+
+void Listener::on_event(uint32_t events) {
+    while (true) {
+        int client_fd = accept4(fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            perror("accept4");
+            break;
+        }
+        if (client_fd >= 0) {
+            on_accept_(client_fd);
+        }
+    }
+}
+
+Listener::~Listener() {
+    close(fd_);
+}
+
+
