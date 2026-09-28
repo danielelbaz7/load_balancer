@@ -5,4 +5,6 @@ set(CMAKE_CXX_STANDARD 20)
 
 add_executable(load_balancer main.cpp
         listener.cpp
-        listener.h)
+        listener.h
+        load_balancer.cpp
+        load_balancer.h)
