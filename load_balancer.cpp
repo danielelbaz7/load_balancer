@@ -1,6 +1,7 @@
 #include "load_balancer.h"
 
 #include <cerrno>
+#include <iostream>
 #include <sys/epoll.h>
 #include <system_error>
 #include <unistd.h>
@@ -23,3 +24,9 @@ LoadBalancer::LoadBalancer(uint16_t port)
         throw std::system_error(err, std::generic_category(), "epoll_ctl");
     }
 }
+
+void LoadBalancer::on_new_client(int client_fd) {
+    std::cout << client_fd << std::endl;
+    close(client_fd);
+}
+
