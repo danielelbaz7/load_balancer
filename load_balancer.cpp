@@ -1,6 +1,7 @@
 #include "load_balancer.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <iostream>
 #include <sys/epoll.h>
 #include <system_error>
@@ -29,4 +30,32 @@ void LoadBalancer::on_new_client(int client_fd) {
     std::cout << client_fd << std::endl;
     close(client_fd);
 }
+
+void LoadBalancer::run() {
+    epoll_event events[64];
+    while (true) {
+        // Sleep until at least one registered fd is ready (-1 = no timeout).
+        int n = epoll_wait(epfd_, events, 64, -1);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue; // interrupted by a signal, not a real error
+            }
+            perror("epoll_wait");
+            continue;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == listener_.fd()) {
+                listener_.on_event(events[i].events);
+            }
+        }
+    }
+}
+
+LoadBalancer::~LoadBalancer() {
+    if (epfd_ < 0) {
+        return;
+    }
+    close(epfd_);
+}
+
 
