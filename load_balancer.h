@@ -1,6 +1,7 @@
 #ifndef LOAD_BALANCER_LOAD_BALANCER_H
 #define LOAD_BALANCER_LOAD_BALANCER_H
 
+#include "backend_pool.h"
 #include "listener.h"
 
 #include <cstdint>
@@ -26,6 +27,7 @@ private:
 
     // Declaration order = construction order: epfd_ is created before listener_.
     int epfd_ = -1;
+    BackendPool pool_; // declared before anything that points into it, so it's destroyed last
     Listener listener_;
 };
 

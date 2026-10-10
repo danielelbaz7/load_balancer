@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <iostream>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <system_error>
 #include <unistd.h>
 
@@ -27,8 +28,38 @@ LoadBalancer::LoadBalancer(uint16_t port)
 }
 
 void LoadBalancer::on_new_client(int client_fd) {
-    std::cout << client_fd << std::endl;
+    Backend* backend = pool_.choose_backend();
+    if (backend == nullptr) { // no backends to send this client to
+        close(client_fd);
+        return;
+    }
+
+    int backend_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (backend_fd < 0) {
+        perror("socket");
+        close(client_fd);
+        return;
+    }
+
+    // Non-blocking connect: EINPROGRESS means the handshake has started and will finish
+    // later; epoll reports backend_fd as writable (EPOLLOUT) when it does.
+    if (connect(backend_fd, reinterpret_cast<const sockaddr*>(&backend->addr), sizeof(backend->addr)) < 0
+        && errno != EINPROGRESS) {
+        perror("connect");
+        close(backend_fd);
+        close(client_fd);
+        return;
+    }
+
+    backend->active_connections++;
+    std::cout << "client fd " << client_fd << " -> backend port " << ntohs(backend->addr.sin_port)
+              << " (backend fd " << backend_fd << ")" << std::endl;
+
+    // TODO: create a Connection, map both fds to it, and register them with epoll.
+    // Until then nothing tracks these sockets, so close them now to avoid leaking fds.
+    close(backend_fd);
     close(client_fd);
+    backend->active_connections--;
 }
 
 void LoadBalancer::run() {
