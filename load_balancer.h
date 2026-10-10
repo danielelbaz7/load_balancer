@@ -5,13 +5,16 @@
 #include "listener.h"
 
 #include <cstdint>
+#include <netinet/in.h>
+#include <vector>
 
 // Top-level object: owns the epoll instance and the Listener, and runs the event loop.
 class LoadBalancer {
 public:
-    // Creates the epoll instance, starts the Listener on `port`,
-    // and registers the listening socket with epoll.
-    explicit LoadBalancer(uint16_t port);
+    // Creates the epoll instance, starts the Listener on `port`, registers the
+    // listening socket with epoll, and fills the pool. The backend list is fixed
+    // after this: the pool never grows, so Backend* pointers stay valid.
+    LoadBalancer(uint16_t port, const std::vector<sockaddr_in>& backends);
     ~LoadBalancer();
 
     // Owns an fd (epfd_), so no copying.

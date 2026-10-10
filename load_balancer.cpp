@@ -8,7 +8,7 @@
 #include <system_error>
 #include <unistd.h>
 
-LoadBalancer::LoadBalancer(uint16_t port)
+LoadBalancer::LoadBalancer(uint16_t port, const std::vector<sockaddr_in>& backends)
     : epfd_(epoll_create1(EPOLL_CLOEXEC)),
       listener_(port, [this](int fd) { on_new_client(fd); }) {
 
@@ -24,6 +24,10 @@ LoadBalancer::LoadBalancer(uint16_t port)
         int err = errno; // save before close() can overwrite it
         close(epfd_);    // destructor won't run if we throw, so clean up here
         throw std::system_error(err, std::generic_category(), "epoll_ctl");
+    }
+
+    for (const sockaddr_in& addr : backends) {
+        pool_.add_backend(addr);
     }
 }
 
