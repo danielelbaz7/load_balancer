@@ -2,10 +2,12 @@
 #define LOAD_BALANCER_LOAD_BALANCER_H
 
 #include "backend_pool.h"
+#include "connection.h"
 #include "listener.h"
 
 #include <cstdint>
 #include <netinet/in.h>
+#include <unordered_map>
 #include <vector>
 
 // Top-level object: owns the epoll instance and the Listener, and runs the event loop.
@@ -28,9 +30,21 @@ private:
     // Called by the Listener for every accepted client.
     void on_new_client(int client_fd);
 
+    // Called from run() for any fd that belongs to a Connection.
+    void on_connection_event(int fd, uint32_t events);
+
+    // The backend's non-blocking connect finished (successfully or not).
+    void on_backend_connected(Connection* conn);
+
+    // Closes both sockets, forgets both fds, and frees the Connection.
+    void close_connection(Connection* conn);
+
     // Declaration order = construction order: epfd_ is created before listener_.
     int epfd_ = -1;
     BackendPool pool_; // declared before anything that points into it, so it's destroyed last
+    // Both fds of a Connection map to the same Connection. Owns the Connections
+    // (new in on_new_client, delete in close_connection).
+    std::unordered_map<int, Connection*> conns_;
     Listener listener_;
 };
 
