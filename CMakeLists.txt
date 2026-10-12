@@ -9,4 +9,5 @@ add_executable(load_balancer main.cpp
         load_balancer.cpp
         load_balancer.h
         backend_pool.cpp
-        backend_pool.h)
+        backend_pool.h
+        connection.h)
