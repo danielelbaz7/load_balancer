@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <netinet/in.h>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -38,6 +39,16 @@ private:
 
     // Closes both sockets, forgets both fds, and frees the Connection.
     void close_connection(Connection* conn);
+
+    // Reads from one side until EAGAIN and sends it to the other side.
+    // Returns false if the connection should be closed.
+    bool forward(Connection* conn, bool from_client);
+
+    // Sends bytes that were waiting for `fd`. Returns false on error.
+    bool flush(int fd, std::string& waiting);
+
+    // Updates both fds' epoll masks to match what's waiting (backpressure).
+    bool update_interest(Connection* conn);
 
     // Declaration order = construction order: epfd_ is created before listener_.
     int epfd_ = -1;

@@ -88,13 +88,130 @@ void LoadBalancer::on_connection_event(int fd, uint32_t events) {
         return;
     }
 
-    // Either side hung up or errored.
-    if (events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+    // Socket error or full hangup: nothing more can be sent or received.
+    if (events & (EPOLLHUP | EPOLLERR)) {
         close_connection(conn);
         return;
     }
 
-    // TODO (next step): EPOLLIN -> read from this fd and write to the other one.
+    bool is_client = (fd == conn->client_fd);
+
+    // This fd has room again: send what was waiting for it.
+    if (events & EPOLLOUT) {
+        std::string& waiting = is_client ? conn->to_client : conn->to_backend;
+        if (!flush(fd, waiting)) {
+            close_connection(conn);
+            return;
+        }
+    }
+
+    // Data arrived: pass it to the other side. Done before the hangup check so a
+    // final message that arrives together with the hangup still gets forwarded.
+    if (events & EPOLLIN) {
+        if (!forward(conn, is_client)) {
+            close_connection(conn);
+            return;
+        }
+    }
+
+    // The peer closed its side.
+    if (events & EPOLLRDHUP) {
+        close_connection(conn);
+        return;
+    }
+
+    if (!update_interest(conn)) {
+        close_connection(conn);
+    }
+}
+
+// Sends as much of [data, data+len) as the socket accepts right now.
+// Returns bytes sent (may be less than len if the socket is full), or -1 on error.
+// MSG_NOSIGNAL: writing to a closed socket returns EPIPE instead of killing us with SIGPIPE.
+static ssize_t send_some(int fd, const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t w = send(fd, data + sent, len - sent, MSG_NOSIGNAL);
+        if (w > 0) {
+            sent += static_cast<size_t>(w);
+        } else if (w < 0 && errno == EINTR) {
+            continue;
+        } else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break; // socket's send buffer is full; the rest waits
+        } else {
+            return -1;
+        }
+    }
+    return static_cast<ssize_t>(sent);
+}
+
+bool LoadBalancer::forward(Connection* conn, bool from_client) {
+    int from = from_client ? conn->client_fd : conn->backend_fd;
+    int to = from_client ? conn->backend_fd : conn->client_fd;
+    std::string& waiting = from_client ? conn->to_backend : conn->to_client;
+
+    char buf[16384];
+    // Stop reading once the other side is backed up (backpressure): the kernel
+    // keeps the rest in this socket's receive buffer until we resume.
+    while (waiting.empty()) {
+        ssize_t n = read(from, buf, sizeof(buf));
+        if (n > 0) {
+            ssize_t sent = send_some(to, buf, static_cast<size_t>(n));
+            if (sent < 0) {
+                return false;
+            }
+            if (sent < n) {
+                waiting.append(buf + sent, static_cast<size_t>(n - sent));
+            }
+        } else if (n == 0) {
+            return false; // peer closed
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true; // read everything available for now
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LoadBalancer::flush(int fd, std::string& waiting) {
+    ssize_t sent = send_some(fd, waiting.data(), waiting.size());
+    if (sent < 0) {
+        return false;
+    }
+    waiting.erase(0, static_cast<size_t>(sent));
+    return true;
+}
+
+bool LoadBalancer::update_interest(Connection* conn) {
+    // Read from a side only while nothing is waiting to go to the other side;
+    // ask for EPOLLOUT on a side only while something is waiting to go to it.
+    uint32_t client = EPOLLRDHUP | (conn->to_backend.empty() ? EPOLLIN : 0)
+                                 | (conn->to_client.empty() ? 0 : EPOLLOUT);
+    uint32_t backend = EPOLLRDHUP | (conn->to_client.empty() ? EPOLLIN : 0)
+                                  | (conn->to_backend.empty() ? 0 : EPOLLOUT);
+
+    // Only call epoll_ctl when the mask actually changes (it's a system call).
+    epoll_event ev{};
+    if (client != conn->client_events) {
+        ev.events = client;
+        ev.data.fd = conn->client_fd;
+        if (epoll_ctl(epfd_, EPOLL_CTL_MOD, conn->client_fd, &ev) < 0) {
+            return false;
+        }
+        conn->client_events = client;
+    }
+    if (backend != conn->backend_events) {
+        ev.events = backend;
+        ev.data.fd = conn->backend_fd;
+        if (epoll_ctl(epfd_, EPOLL_CTL_MOD, conn->backend_fd, &ev) < 0) {
+            return false;
+        }
+        conn->backend_events = backend;
+    }
+    return true;
 }
 
 void LoadBalancer::on_backend_connected(Connection* conn) {
@@ -112,9 +229,11 @@ void LoadBalancer::on_backend_connected(Connection* conn) {
     }
     conn->connected = true;
 
-    // Watch both sides for hangups. The next step adds EPOLLIN here to forward data.
+    // Watch both sides for data and hangups.
     epoll_event ev{};
-    ev.events = EPOLLRDHUP;
+    ev.events = EPOLLIN | EPOLLRDHUP;
+    conn->client_events = ev.events;
+    conn->backend_events = ev.events;
     ev.data.fd = conn->backend_fd;
     if (epoll_ctl(epfd_, EPOLL_CTL_MOD, conn->backend_fd, &ev) < 0) {
         perror("epoll_ctl(mod backend)");
