@@ -105,17 +105,20 @@ void LoadBalancer::on_connection_event(int fd, uint32_t events) {
         }
     }
 
-    // Data arrived: pass it to the other side. Done before the hangup check so a
-    // final message that arrives together with the hangup still gets forwarded.
-    if (events & EPOLLIN) {
+    // Data arrived, or the peer stopped sending (RDHUP). Either way, read: forward()
+    // passes along any last bytes and marks the side done when read() returns 0.
+    if (events & (EPOLLIN | EPOLLRDHUP)) {
         if (!forward(conn, is_client)) {
             close_connection(conn);
             return;
         }
     }
 
-    // The peer closed its side.
-    if (events & EPOLLRDHUP) {
+    // A side that stopped sending is finished only once everything it sent has been
+    // delivered. E.g. the backend sends a response and closes, but a slow client
+    // hasn't received all of it yet: keep the connection until to_client is empty.
+    if ((conn->backend_done && conn->to_client.empty()) ||
+        (conn->client_done && conn->to_backend.empty())) {
         close_connection(conn);
         return;
     }
@@ -164,7 +167,10 @@ bool LoadBalancer::forward(Connection* conn, bool from_client) {
                 waiting.append(buf + sent, static_cast<size_t>(n - sent));
             }
         } else if (n == 0) {
-            return false; // peer closed
+            // Peer stopped sending. Don't close yet: bytes may still be waiting
+            // to go the other way. on_connection_event decides when to close.
+            (from_client ? conn->client_done : conn->backend_done) = true;
+            return true;
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -186,12 +192,16 @@ bool LoadBalancer::flush(int fd, std::string& waiting) {
 }
 
 bool LoadBalancer::update_interest(Connection* conn) {
-    // Read from a side only while nothing is waiting to go to the other side;
-    // ask for EPOLLOUT on a side only while something is waiting to go to it.
-    uint32_t client = EPOLLRDHUP | (conn->to_backend.empty() ? EPOLLIN : 0)
-                                 | (conn->to_client.empty() ? 0 : EPOLLOUT);
-    uint32_t backend = EPOLLRDHUP | (conn->to_client.empty() ? EPOLLIN : 0)
-                                  | (conn->to_backend.empty() ? 0 : EPOLLOUT);
+    // Read from a side only while it's still sending and nothing is waiting to go
+    // to the other side (backpressure). RDHUP is only watched together with EPOLLIN:
+    // otherwise a paused or finished side would report "hung up" over and over.
+    // Ask for EPOLLOUT on a side only while something is waiting to go to it.
+    bool read_client = !conn->client_done && conn->to_backend.empty();
+    bool read_backend = !conn->backend_done && conn->to_client.empty();
+    uint32_t client = (read_client ? EPOLLIN | EPOLLRDHUP : 0)
+                    | (conn->to_client.empty() ? 0 : EPOLLOUT);
+    uint32_t backend = (read_backend ? EPOLLIN | EPOLLRDHUP : 0)
+                     | (conn->to_backend.empty() ? 0 : EPOLLOUT);
 
     // Only call epoll_ctl when the mask actually changes (it's a system call).
     epoll_event ev{};
