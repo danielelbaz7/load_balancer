@@ -50,9 +50,17 @@ private:
     // Updates both fds' epoll masks to match what's waiting (backpressure).
     bool update_interest(Connection* conn);
 
+    // Health checks: every tick, try a TCP connect to each backend.
+    void on_health_tick();
+    // A probe's connect finished (successfully or not).
+    void on_probe_done(int probe_fd);
+
     // Declaration order = construction order: epfd_ is created before listener_.
     int epfd_ = -1;
+    int timer_fd_ = -1; // fires every health-check interval
     BackendPool pool_; // declared before anything that points into it, so it's destroyed last
+    // In-flight health probe socket -> the backend it's checking.
+    std::unordered_map<int, Backend*> probes_;
     // Both fds of a Connection map to the same Connection. Owns the Connections
     // (new in on_new_client, delete in close_connection).
     std::unordered_map<int, Connection*> conns_;

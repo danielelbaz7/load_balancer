@@ -6,8 +6,12 @@
 #include <iostream>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <system_error>
 #include <unistd.h>
+
+// Seconds between health-check probes.
+static constexpr int kHealthIntervalSec = 2;
 
 LoadBalancer::LoadBalancer(uint16_t port, const std::vector<sockaddr_in>& backends)
     : epfd_(epoll_create1(EPOLL_CLOEXEC)),
@@ -30,6 +34,86 @@ LoadBalancer::LoadBalancer(uint16_t port, const std::vector<sockaddr_in>& backen
     for (const sockaddr_in& addr : backends) {
         pool_.add_backend(addr);
     }
+
+    // Health-check timer: a timerfd becomes readable every interval, so epoll can
+    // wake us for it like any socket.
+    timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timer_fd_ < 0) {
+        int err = errno;
+        close(epfd_);
+        throw std::system_error(err, std::generic_category(), "timerfd_create");
+    }
+    itimerspec interval{};
+    interval.it_value.tv_sec = kHealthIntervalSec;    // first tick
+    interval.it_interval.tv_sec = kHealthIntervalSec; // then every interval
+    epoll_event tev{};
+    tev.events = EPOLLIN;
+    tev.data.fd = timer_fd_;
+    if (timerfd_settime(timer_fd_, 0, &interval, nullptr) < 0 ||
+        epoll_ctl(epfd_, EPOLL_CTL_ADD, timer_fd_, &tev) < 0) {
+        int err = errno;
+        close(timer_fd_);
+        close(epfd_);
+        throw std::system_error(err, std::generic_category(), "health timer setup");
+    }
+}
+
+void LoadBalancer::on_health_tick() {
+    uint64_t expirations;
+    while (read(timer_fd_, &expirations, sizeof(expirations)) > 0) {
+        // drain the timer so epoll stops reporting it until the next tick
+    }
+
+    for (Backend& backend : pool_.backends()) {
+        // A probe from the last tick that still hasn't connected counts as a failure
+        // (this is the probe's timeout).
+        if (backend.probe_fd >= 0) {
+            probes_.erase(backend.probe_fd);
+            close(backend.probe_fd);
+            backend.probe_fd = -1;
+            pool_.record_result(backend, false);
+        }
+
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            perror("socket(probe)");
+            continue;
+        }
+        if (connect(fd, reinterpret_cast<const sockaddr*>(&backend.addr), sizeof(backend.addr)) < 0
+            && errno != EINPROGRESS) {
+            close(fd); // refused right away
+            pool_.record_result(backend, false);
+            continue;
+        }
+        epoll_event ev{};
+        ev.events = EPOLLOUT; // writable = connect finished
+        ev.data.fd = fd;
+        if (epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            perror("epoll_ctl(probe)");
+            close(fd);
+            continue;
+        }
+        backend.probe_fd = fd;
+        probes_[fd] = &backend;
+    }
+}
+
+void LoadBalancer::on_probe_done(int probe_fd) {
+    auto it = probes_.find(probe_fd);
+    if (it == probes_.end()) {
+        return;
+    }
+    Backend* backend = it->second;
+    probes_.erase(it);
+
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(probe_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+        err = errno;
+    }
+    close(probe_fd);
+    backend->probe_fd = -1;
+    pool_.record_result(*backend, err == 0);
 }
 
 void LoadBalancer::on_new_client(int client_fd) {
@@ -234,6 +318,7 @@ void LoadBalancer::on_backend_connected(Connection* conn) {
     if (err != 0) {
         std::cerr << "backend port " << ntohs(conn->backend->addr.sin_port)
                   << " connect failed: " << std::strerror(err) << std::endl;
+        pool_.record_result(*conn->backend, false); // passive health check
         close_connection(conn);
         return;
     }
@@ -287,8 +372,13 @@ void LoadBalancer::run() {
             continue;
         }
         for (int i = 0; i < n; ++i) {
-            if (events[i].data.fd == listener_.fd()) {
+            int fd = events[i].data.fd;
+            if (fd == listener_.fd()) {
                 listener_.on_event(events[i].events);
+            } else if (fd == timer_fd_) {
+                on_health_tick();
+            } else if (probes_.count(fd)) {
+                on_probe_done(fd);
             } else {
                 on_connection_event(events[i].data.fd, events[i].events);
             }
@@ -307,6 +397,13 @@ LoadBalancer::~LoadBalancer() {
         }
     }
     conns_.clear();
+
+    for (auto& [fd, backend] : probes_) {
+        close(fd);
+    }
+    if (timer_fd_ >= 0) {
+        close(timer_fd_);
+    }
 
     if (epfd_ < 0) {
         return;
